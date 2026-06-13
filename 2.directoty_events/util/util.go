@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -73,11 +75,25 @@ func readInotifyBuffer(watchPaths map[int]string, buf []byte, bufSize int) error
 			return err
 		}
 
+		var name string
+		if event.Len > 0 {
+			nameBytes := make([]byte, event.Len)
+			if _, err := io.ReadFull(bufReader, nameBytes); err != nil {
+				fmt.Printf("Problem while reading inotify event name: %v\n", err)
+				return err
+			}
+			name = strings.TrimRight(string(nameBytes), "\x00")
+		}
+
 		eventPath, err := getWatchingPath(watchPaths, int(event.Wd))
 		if err != nil {
 			fmt.Println(err)
 		} else {
-			fmt.Printf("Got event: wd=%d mask=%s path=%s\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath)
+			if name != "" {
+				fmt.Printf("Got event: wd=%d mask=%s path=%s name=%s\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath, name)
+			} else {
+				fmt.Printf("Got event: wd=%d mask=%s path=%s\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath)
+			}
 		}
 	}
 	return nil
@@ -85,23 +101,41 @@ func readInotifyBuffer(watchPaths map[int]string, buf []byte, bufSize int) error
 
 // Get event mask in string representation
 func getEventStrRepresentation(eventMask uint32) string {
+	representation := make([]string, 0)
+
 	if eventMask&unix.IN_MODIFY != 0 {
-		return "modification"
+		representation = append(representation, "modification")
 	}
 
 	if eventMask&unix.IN_ATTRIB != 0 {
-		return "change attributes"
+		representation = append(representation, "change attributes")
 	}
 
 	if eventMask&unix.IN_DELETE_SELF != 0 {
-		return "self deletion"
+		representation = append(representation, "self deletion")
 	}
 
 	if eventMask&unix.IN_MOVE_SELF != 0 {
-		return "self movement"
+		representation = append(representation, "self movement")
 	}
 
-	return "N/A"
+	if eventMask&unix.IN_CREATE != 0 {
+		representation = append(representation, "inner item creation")
+	}
+
+	if eventMask&unix.IN_DELETE != 0 {
+		representation = append(representation, "inner item deletion")
+	}
+
+	if eventMask&unix.IN_MOVED_FROM != 0 {
+		representation = append(representation, "inner item move from")
+	}
+
+	if eventMask&unix.IN_MOVED_TO != 0 {
+		representation = append(representation, "inner item move to")
+	}
+
+	return strings.Join(representation, ",")
 }
 
 // Get watching path by watch descriptor
