@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"inotify-project/util"
-	"io/fs"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -25,26 +23,9 @@ func Run(testPath *string) {
 	defer unix.Close(inFd)
 
 	// 2.Add input path to the group with recursion logic
-	eventsMask := unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF |
-		unix.IN_MOVE_SELF | unix.IN_CREATE | unix.IN_DELETE |
-		unix.IN_MOVED_FROM | unix.IN_MOVED_TO
-
-	addErr := filepath.WalkDir(*testPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		wd, err := unix.InotifyAddWatch(inFd, path, uint32(eventsMask))
-		if err != nil {
-			fmt.Printf("Error while adding %s to the inotify group: %v\n", path, err)
-			return err
-		}
-		watchPaths[wd] = path
-
-		return nil
-	})
-	if addErr != nil {
-		fmt.Printf("Error while add %s: %v\nAdded objects count is %d\n", *testPath, addErr, len(watchPaths))
+	err = util.AddPathToWatchRecursively(inFd, testPath)
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
 

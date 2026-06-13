@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,15 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+)
+
+var (
+	EventsMask = unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF |
+		unix.IN_MOVE_SELF | unix.IN_CREATE | unix.IN_DELETE |
+		unix.IN_MOVED_FROM | unix.IN_MOVED_TO
+
+	watchToPath = make(map[int]string)
+	pathToWatch = make(map[string]int)
 )
 
 // Fixed-size part of C-kernel `inotify_event` (name[] is variable-length, read separately).
@@ -23,11 +33,35 @@ type inotifyEvent struct {
 	Len    uint32
 }
 
+// Add path to the inotify group recursively
+func AddPathToWatchRecursively(inFd int, testPath *string) error {
+	addErr := filepath.WalkDir(*testPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		wd, err := unix.InotifyAddWatch(inFd, path, uint32(EventsMask))
+		if err != nil {
+			fmt.Printf("Error while adding %s to the inotify group: %v\n", path, err)
+			return err
+		}
+		watchToPath[wd] = path
+		pathToWatch[path] = wd
+
+		return nil
+	})
+	if addErr != nil {
+		return fmt.Errorf("Error while add %s: %v\nAdded objects count is %d\n", *testPath, addErr, len(watchToPath))
+	}
+
+	return nil
+}
+
 // Listen and print to log inotify events
-func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd int) error {
+func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd int) error {
 	// 1.Listen indefinitely
 	buf := make([]byte, 4096)
-	pfds := []unix.PollFd{{Fd: int32(fanFd), Events: unix.POLLIN}}
+	pfds := []unix.PollFd{{Fd: int32(inFd), Events: unix.POLLIN}}
 
 	for ctx.Err() == nil {
 		// 2.Use a finite timeout to allow checking ctx cancellation.
@@ -43,7 +77,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd i
 		}
 
 		// 3.Read binary data from inotify queue
-		n, err := unix.Read(fanFd, buf)
+		n, err := unix.Read(inFd, buf)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EINTR {
 				continue
@@ -56,7 +90,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd i
 		}
 
 		// 4.Read binary buffer
-		err = readInotifyBuffer(watchPaths, buf, n)
+		err = readInotifyBuffer(inFd, watchPaths, buf, n)
 		if err != nil {
 			return err
 		}
@@ -66,7 +100,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd i
 }
 
 // Parse inotify binary buffer
-func readInotifyBuffer(watchPaths map[int]string, buf []byte, bufSize int) error {
+func readInotifyBuffer(inFd int, watchPaths map[int]string, buf []byte, bufSize int) error {
 	bufReader := bytes.NewReader(buf[:bufSize])
 
 	for bufReader.Len() > 0 {
@@ -99,15 +133,20 @@ func readInotifyBuffer(watchPaths map[int]string, buf []byte, bufSize int) error
 				childPathInode := getPathInode(&childPath)
 				fmt.Printf("Got event: wd=%d mask=%s path=%s name=%s inodeParent=%d inodeChild=%d\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath, name, eventPathInode, childPathInode)
 
-				if eventMask&unix.IN_CREATE != 0 || eventMask&unix.IN_MOVED_TO != 0 {
-					childWd, err := unix.InotifyAddWatch(inFd, childPath, uint32(eventsMask))
+				if event.Mask&unix.IN_CREATE != 0 || event.Mask&unix.IN_MOVED_TO != 0 {
+					childWd, err := unix.InotifyAddWatch(inFd, childPath, uint32(EventsMask))
 					if err != nil {
 						fmt.Printf("Error while adding %s to the inotify group: %v\n", childPath, err)
 						continue
 					}
 					watchPaths[childWd] = childPath
-				} else if eventMask&unix.IN_DELETE != 0 || eventMask&unix.IN_MOVED_FROM != 0 {
-					delete(watchPaths, childWd)
+				} else if event.Mask&unix.IN_DELETE != 0 || event.Mask&unix.IN_MOVED_FROM != 0 {
+					childWd, isWatched := pathToWatch[childPath]
+					if isWatched {
+						delete(watchPaths, childWd)
+						delete(pathToWatch, childPath)
+					}
+
 				}
 			} else {
 				fmt.Printf("Got event: wd=%d mask=%s path=%s inode=%d\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath, eventPathInode)

@@ -21,10 +21,10 @@ type inotifyEvent struct {
 }
 
 // Listen and print to log inotify events
-func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd int) error {
+func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd int) error {
 	// 1.Listen indefinitely
 	buf := make([]byte, 4096)
-	pfds := []unix.PollFd{{Fd: int32(fanFd), Events: unix.POLLIN}}
+	pfds := []unix.PollFd{{Fd: int32(inFd), Events: unix.POLLIN}}
 
 	for ctx.Err() == nil {
 		// 2.Use a finite timeout to allow checking ctx cancellation.
@@ -40,7 +40,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, fanFd i
 		}
 
 		// 3.Read binary data from inotify queue
-		n, err := unix.Read(fanFd, buf)
+		n, err := unix.Read(inFd, buf)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EINTR {
 				continue
