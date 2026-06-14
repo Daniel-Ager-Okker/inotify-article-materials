@@ -21,7 +21,6 @@ var (
 		unix.IN_MOVE_SELF | unix.IN_CREATE | unix.IN_DELETE |
 		unix.IN_MOVED_FROM | unix.IN_MOVED_TO
 
-	watchToPath = make(map[int]string)
 	pathToWatch = make(map[string]int)
 )
 
@@ -34,24 +33,33 @@ type inotifyEvent struct {
 }
 
 // Add path to the inotify group recursively
-func AddPathToWatchRecursively(inFd int, testPath *string) error {
+func AddPathToWatchRecursively(inFd int, testPath *string, watchPaths map[int]string) error {
 	addErr := filepath.WalkDir(*testPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if os.IsPermission(err) {
+				return filepath.SkipDir
+			}
 			return err
 		}
 
 		wd, err := unix.InotifyAddWatch(inFd, path, uint32(EventsMask))
 		if err != nil {
+			if os.IsPermission(err) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			fmt.Printf("Error while adding %s to the inotify group: %v\n", path, err)
 			return err
 		}
-		watchToPath[wd] = path
+		watchPaths[wd] = path
 		pathToWatch[path] = wd
 
 		return nil
 	})
 	if addErr != nil {
-		return fmt.Errorf("Error while add %s: %v\nAdded objects count is %d\n", *testPath, addErr, len(watchToPath))
+		return fmt.Errorf("Error while add %s: %v\nAdded objects count is %d\n", *testPath, addErr, len(watchPaths))
 	}
 
 	return nil
@@ -124,7 +132,7 @@ func readInotifyBuffer(inFd int, watchPaths map[int]string, buf []byte, bufSize 
 
 		eventPath, err := getWatchingPath(watchPaths, int(event.Wd))
 		if err != nil {
-			fmt.Println(err)
+			continue
 		} else {
 			eventPathInode := getPathInode(eventPath)
 
@@ -140,6 +148,7 @@ func readInotifyBuffer(inFd int, watchPaths map[int]string, buf []byte, bufSize 
 						continue
 					}
 					watchPaths[childWd] = childPath
+					pathToWatch[childPath] = childWd
 				} else if event.Mask&unix.IN_DELETE != 0 || event.Mask&unix.IN_MOVED_FROM != 0 {
 					childWd, isWatched := pathToWatch[childPath]
 					if isWatched {

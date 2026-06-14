@@ -23,7 +23,7 @@ func Run(testPath *string) {
 	defer unix.Close(inFd)
 
 	// 2.Add input path to the group with recursion logic
-	err = util.AddPathToWatchRecursively(inFd, testPath)
+	err = util.AddPathToWatchRecursively(inFd, testPath, watchPaths)
 	if err != nil {
 		fmt.Println(err)
 		return
