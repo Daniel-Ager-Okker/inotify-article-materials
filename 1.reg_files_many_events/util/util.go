@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Fixed-size part of C-kernel `inotify_event` (name[] is variable-length, read separately).
+const FileEventsMask = unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
+
+// Fixed-size part of C struct inotify_event (name[] follows, variable length).
 type inotifyEvent struct {
 	Wd     int32
 	Mask   uint32
@@ -31,7 +35,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 			if err == unix.EINTR {
 				continue
 			}
-			return fmt.Errorf("poll(): %w", err)
+			return fmt.Errorf("poll: %w", err)
 		}
 		if pfds[0].Revents&unix.POLLIN == 0 {
 			continue
@@ -43,16 +47,15 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 			if err == unix.EAGAIN || err == unix.EINTR {
 				continue
 			}
-			return fmt.Errorf("read(): %w", err)
+			return fmt.Errorf("read: %w", err)
 		}
 		if n <= 0 {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
-		// 5.Read binary buffer
-		err = readInotifyBuffer(watchPaths, buf, n)
-		if err != nil {
+		// 4.Read binary buffer
+		if err := readInotifyBuffer(watchPaths, buf, n); err != nil {
 			return err
 		}
 	}
@@ -61,55 +64,62 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 }
 
 // Parse inotify binary buffer
-func readInotifyBuffer(watchPaths map[int]string, buf []byte, bufSize int) error {
-	bufReader := bytes.NewReader(buf[:bufSize])
+func readInotifyBuffer(watchPaths map[int]string, buf []byte, n int) error {
+	r := bytes.NewReader(buf[:n])
 
-	for bufReader.Len() > 0 {
+	for r.Len() > 0 {
 		var event inotifyEvent
-
-		err := binary.Read(bufReader, binary.LittleEndian, &event)
-		if err != nil {
-			fmt.Printf("Problem while reading inotify event buffer: %v\n", err)
-			return err
+		if err := binary.Read(r, binary.LittleEndian, &event); err != nil {
+			return fmt.Errorf("read event: %w", err)
 		}
 
-		eventPath, err := getWatchingPath(watchPaths, int(event.Wd))
+		if event.Len > 0 {
+			if _, err := r.Seek(int64(event.Len), io.SeekCurrent); err != nil {
+				return fmt.Errorf("skip name: %w", err)
+			}
+		}
+
+		path, err := watchPath(watchPaths, int(event.Wd))
 		if err != nil {
 			fmt.Println(err)
-		} else {
-			fmt.Printf("Got event: wd=%d mask=%s path=%s\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath)
+			continue
 		}
+
+		fmt.Printf("Got event: wd=%d mask=%s path=%s\n",
+			event.Wd, formatEventMask(event.Mask), path)
 	}
+
 	return nil
 }
 
 // Get event mask in string representation
-func getEventStrRepresentation(eventMask uint32) string {
-	if eventMask&unix.IN_MODIFY != 0 {
-		return "modification"
+func formatEventMask(mask uint32) string {
+	var parts []string
+
+	if mask&unix.IN_MODIFY != 0 {
+		parts = append(parts, "modification")
+	}
+	if mask&unix.IN_ATTRIB != 0 {
+		parts = append(parts, "change attributes")
+	}
+	if mask&unix.IN_DELETE_SELF != 0 {
+		parts = append(parts, "self deletion")
+	}
+	if mask&unix.IN_MOVE_SELF != 0 {
+		parts = append(parts, "self movement")
+	}
+	if len(parts) == 0 {
+		return "unknown"
 	}
 
-	if eventMask&unix.IN_ATTRIB != 0 {
-		return "change attributes"
-	}
-
-	if eventMask&unix.IN_DELETE_SELF != 0 {
-		return "self deletion"
-	}
-
-	if eventMask&unix.IN_MOVE_SELF != 0 {
-		return "self movement"
-	}
-
-	return "N/A"
+	return strings.Join(parts, ",")
 }
 
 // Get watching path by watch descriptor
-func getWatchingPath(watchPaths map[int]string, watchDescriptor int) (*string, error) {
-	path, in := watchPaths[watchDescriptor]
-	if !in {
-		return nil, fmt.Errorf("no path with wd %d", watchDescriptor)
+func watchPath(watchPaths map[int]string, wd int) (string, error) {
+	path, ok := watchPaths[wd]
+	if !ok {
+		return "", fmt.Errorf("no path for wd %d", wd)
 	}
-
-	return &path, nil
+	return path, nil
 }

@@ -10,21 +10,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-var (
-	EventsMask = unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF |
-		unix.IN_MOVE_SELF | unix.IN_CREATE | unix.IN_DELETE |
-		unix.IN_MOVED_FROM | unix.IN_MOVED_TO
+const DirEventsMask = unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF |
+	unix.IN_MOVE_SELF | unix.IN_CREATE | unix.IN_DELETE |
+	unix.IN_MOVED_FROM | unix.IN_MOVED_TO
 
-	pathToWatch = make(map[string]int)
-)
+var pathToWatch = make(map[string]int)
 
-// Fixed-size part of C-kernel `inotify_event` (name[] is variable-length, read separately).
+// Fixed-size part of C struct inotify_event (name[] follows, variable length).
 type inotifyEvent struct {
 	Wd     int32
 	Mask   uint32
@@ -33,16 +30,16 @@ type inotifyEvent struct {
 }
 
 // Add path to the inotify group recursively
-func AddPathToWatchRecursively(inFd int, testPath *string, watchPaths map[int]string) error {
-	addErr := filepath.WalkDir(*testPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if os.IsPermission(err) {
+func AddPathToWatchRecursively(inFd int, root string, watchPaths map[int]string) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsPermission(walkErr) {
 				return filepath.SkipDir
 			}
-			return err
+			return walkErr
 		}
 
-		wd, err := unix.InotifyAddWatch(inFd, path, uint32(EventsMask))
+		wd, err := unix.InotifyAddWatch(inFd, path, uint32(DirEventsMask))
 		if err != nil {
 			if os.IsPermission(err) {
 				if d.IsDir() {
@@ -50,16 +47,15 @@ func AddPathToWatchRecursively(inFd int, testPath *string, watchPaths map[int]st
 				}
 				return nil
 			}
-			fmt.Printf("Error while adding %s to the inotify group: %v\n", path, err)
-			return err
+			return fmt.Errorf("inotify_add_watch %s: %w", path, err)
 		}
+
 		watchPaths[wd] = path
 		pathToWatch[path] = wd
-
 		return nil
 	})
-	if addErr != nil {
-		return fmt.Errorf("Error while add %s: %v\nAdded objects count is %d\n", *testPath, addErr, len(watchPaths))
+	if err != nil {
+		return fmt.Errorf("adding watches under %s: %w (watches added: %d)", root, err, len(watchPaths))
 	}
 
 	return nil
@@ -78,7 +74,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 			if err == unix.EINTR {
 				continue
 			}
-			return fmt.Errorf("poll(): %w", err)
+			return fmt.Errorf("poll: %w", err)
 		}
 		if pfds[0].Revents&unix.POLLIN == 0 {
 			continue
@@ -90,7 +86,7 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 			if err == unix.EAGAIN || err == unix.EINTR {
 				continue
 			}
-			return fmt.Errorf("read(): %w", err)
+			return fmt.Errorf("read: %w", err)
 		}
 		if n <= 0 {
 			time.Sleep(10 * time.Millisecond)
@@ -98,128 +94,79 @@ func ListenInotifyEvents(watchPaths map[int]string, ctx context.Context, inFd in
 		}
 
 		// 4.Read binary buffer
-		err = readInotifyBuffer(inFd, watchPaths, buf, n)
-		if err != nil {
+		if err := readInotifyBuffer(inFd, watchPaths, buf, n); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("Program is over, length of inner storage: %d\n", len(pathToWatch))
 
+	fmt.Printf("Program is over, length of inner storage: %d\n", len(pathToWatch))
 	return ctx.Err()
 }
 
 // Parse inotify binary buffer
-func readInotifyBuffer(inFd int, watchPaths map[int]string, buf []byte, bufSize int) error {
-	bufReader := bytes.NewReader(buf[:bufSize])
+func readInotifyBuffer(inFd int, watchPaths map[int]string, buf []byte, n int) error {
+	r := bytes.NewReader(buf[:n])
 
-	for bufReader.Len() > 0 {
+	for r.Len() > 0 {
 		var event inotifyEvent
+		if err := binary.Read(r, binary.LittleEndian, &event); err != nil {
+			return fmt.Errorf("read event: %w", err)
+		}
 
-		err := binary.Read(bufReader, binary.LittleEndian, &event)
+		name, err := readEventName(r, event.Len)
 		if err != nil {
-			fmt.Printf("Problem while reading inotify event buffer: %v\n", err)
 			return err
 		}
 
-		var name string
-		if event.Len > 0 {
-			nameBytes := make([]byte, event.Len)
-			if _, err := io.ReadFull(bufReader, nameBytes); err != nil {
-				fmt.Printf("Problem while reading inotify event name: %v\n", err)
-				return err
-			}
-			name = strings.TrimRight(string(nameBytes), "\x00")
-		}
-
-		eventPath, err := getWatchingPath(watchPaths, int(event.Wd))
+		path, err := watchPath(watchPaths, int(event.Wd))
 		if err != nil {
 			continue
-		} else {
-			eventPathInode := getPathInode(eventPath)
+		}
+		if name == "" {
+			continue
+		}
 
-			if name != "" {
-				childPath := filepath.Join(*eventPath, name)
-				childPathInode := getPathInode(&childPath)
-				fmt.Printf("Got event: wd=%d mask=%s path=%s name=%s inodeParent=%d inodeChild=%d\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath, name, eventPathInode, childPathInode)
+		childPath := filepath.Join(path, name)
 
-				if event.Mask&unix.IN_CREATE != 0 || event.Mask&unix.IN_MOVED_TO != 0 {
-					childWd, err := unix.InotifyAddWatch(inFd, childPath, uint32(EventsMask))
-					if err != nil {
-						fmt.Printf("Error while adding %s to the inotify group: %v\n", childPath, err)
-						continue
-					}
-					watchPaths[childWd] = childPath
-					pathToWatch[childPath] = childWd
-				} else if event.Mask&unix.IN_DELETE != 0 || event.Mask&unix.IN_MOVED_FROM != 0 {
-					childWd, isWatched := pathToWatch[childPath]
-					if isWatched {
-						delete(watchPaths, childWd)
-						delete(pathToWatch, childPath)
-					}
+		switch {
+		case event.Mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0:
+			childWd, err := unix.InotifyAddWatch(inFd, childPath, uint32(DirEventsMask))
+			if err != nil {
+				fmt.Printf("inotify_add_watch %s: %v\n", childPath, err)
+				continue
+			}
+			watchPaths[childWd] = childPath
+			pathToWatch[childPath] = childWd
 
-				}
-			} else {
-				fmt.Printf("Got event: wd=%d mask=%s path=%s inode=%d\n", event.Wd, getEventStrRepresentation(event.Mask), *eventPath, eventPathInode)
+		case event.Mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0:
+			if childWd, ok := pathToWatch[childPath]; ok {
+				delete(watchPaths, childWd)
+				delete(pathToWatch, childPath)
 			}
 		}
 	}
+
 	return nil
 }
 
-// Get event mask in string representation
-func getEventStrRepresentation(eventMask uint32) string {
-	representation := make([]string, 0)
-
-	if eventMask&unix.IN_MODIFY != 0 {
-		representation = append(representation, "modification")
+func readEventName(r *bytes.Reader, length uint32) (string, error) {
+	if length == 0 {
+		return "", nil
 	}
 
-	if eventMask&unix.IN_ATTRIB != 0 {
-		representation = append(representation, "change attributes")
+	nameBytes := make([]byte, length)
+	if _, err := io.ReadFull(r, nameBytes); err != nil {
+		return "", fmt.Errorf("read name: %w", err)
 	}
 
-	if eventMask&unix.IN_DELETE_SELF != 0 {
-		representation = append(representation, "self deletion")
-	}
-
-	if eventMask&unix.IN_MOVE_SELF != 0 {
-		representation = append(representation, "self movement")
-	}
-
-	if eventMask&unix.IN_CREATE != 0 {
-		representation = append(representation, "inner item creation")
-	}
-
-	if eventMask&unix.IN_DELETE != 0 {
-		representation = append(representation, "inner item deletion")
-	}
-
-	if eventMask&unix.IN_MOVED_FROM != 0 {
-		representation = append(representation, "inner item move from")
-	}
-
-	if eventMask&unix.IN_MOVED_TO != 0 {
-		representation = append(representation, "inner item move to")
-	}
-
-	return strings.Join(representation, ",")
+	return strings.TrimRight(string(nameBytes), "\x00"), nil
 }
 
 // Get watching path by watch descriptor
-func getWatchingPath(watchPaths map[int]string, watchDescriptor int) (*string, error) {
-	path, in := watchPaths[watchDescriptor]
-	if !in {
-		return nil, fmt.Errorf("no path with wd %d", watchDescriptor)
+func watchPath(watchPaths map[int]string, wd int) (string, error) {
+	path, ok := watchPaths[wd]
+	if !ok {
+		return "", fmt.Errorf("no path for wd %d", wd)
 	}
-
-	return &path, nil
-}
-
-// Get inode of the path
-func getPathInode(path *string) uint64 {
-	stat, err := os.Stat(*path)
-	if err != nil {
-		return 0
-	}
-	return stat.Sys().(*syscall.Stat_t).Ino
+	return path, nil
 }

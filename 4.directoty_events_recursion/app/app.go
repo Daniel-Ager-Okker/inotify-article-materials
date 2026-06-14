@@ -10,21 +10,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var (
-	watchPaths = make(map[int]string)
-)
-
-func Run(testPath *string) {
+func Run(path string) {
 	// 1.Create inotify group
-	inFd, err := initInotifyGroup()
+	inFd, err := unix.InotifyInit()
 	if err != nil {
+		fmt.Printf("inotify_init: %v\n", err)
 		return
 	}
 	defer unix.Close(inFd)
 
 	// 2.Add input path to the group with recursion logic
-	err = util.AddPathToWatchRecursively(inFd, testPath, watchPaths)
-	if err != nil {
+	watchPaths := make(map[int]string)
+	if err := util.AddPathToWatchRecursively(inFd, path, watchPaths); err != nil {
 		fmt.Println(err)
 		return
 	}
@@ -33,20 +30,7 @@ func Run(testPath *string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Mount reference for open_by_handle_at(2): must be an open file on the *same filesystem*
-	// as the inode in the FID event; "/" is often a different FS than e.g. /mnt/c or tmpfs.
-	if err := util.ListenInotifyEvents(watchPaths, ctx, inFd); err != nil {
-		fmt.Printf("listen error: %v\n", err)
-		return
+	if err := util.ListenInotifyEvents(watchPaths, ctx, inFd); err != nil && err != context.Canceled {
+		fmt.Printf("listen: %v\n", err)
 	}
-}
-
-// Create inotify group
-func initInotifyGroup() (int, error) {
-	inFd, err := unix.InotifyInit()
-	if err != nil {
-		fmt.Printf("Error while creating inotify group: %v\n", err)
-		return 0, err
-	}
-	return inFd, nil
 }
